@@ -48,10 +48,17 @@ class GeneratedResult:
 
 def extract_json_payload(raw_content: str) -> dict:
     content = raw_content.strip()
-    match = re.search(r"\{.*\}", content, re.DOTALL)
-    if match:
-        content = match.group(0)
-    return json.loads(content)
+    decoder = json.JSONDecoder()
+    for start, character in enumerate(content):
+        if character != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(content[start:])
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("La réponse Ollama ne contient pas de JSON valide.")
 
 
 def normalize_python_block(content: object) -> str:
@@ -267,6 +274,9 @@ Contraintes obligatoires :
 - tests doit commencer par `import pytest` et contenir au moins une fonction de module `def test_nom():` ;
 - les fonctions importées dans tests doivent réellement exister dans code ;
 - tests doit importer les fonctions depuis `solution.py` ;
+- code doit commencer directement par un import, une définition ou une déclaration Python valide ;
+- code et tests ne doivent contenir aucun texte explicatif, aucune balise Markdown et aucun préfixe `python` ;
+- réécris les deux fichiers en version minimale, sans docstring ni chaîne multilignes ;
 - chaque nom appelé dans un test doit être défini dans `solution.py` ; supprime tout test pour une fonction absente ;
 - utilise des opérations Python simples et valides ; une addition utilise `x + y`, jamais `math.add(x, y)` ;
 - ne crée pas de second nom comme `add_personnalise` si la demande ne le définit pas ;

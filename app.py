@@ -4,6 +4,9 @@ import ast
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 
 import streamlit as st
@@ -36,6 +39,9 @@ class GeneratedResult:
     code: str
     tests: str
     explanation: str
+    analysis: str
+    candidates: list[str]
+    selected_approach: str
     react_steps: list[tuple[str, str]]
     correction_applied: bool
 
@@ -64,7 +70,25 @@ def normalize_python_block(content: object) -> str:
 def normalize_payload(payload: dict) -> dict:
     for field in ("code", "tests"):
         payload[field] = normalize_python_block(payload.get(field))
+    if isinstance(payload.get("candidates"), str):
+        payload["candidates"] = [
+            candidate.strip(" -")
+            for candidate in re.split(r"\r?\n|;", payload["candidates"])
+            if candidate.strip(" -")
+        ]
     return payload
+
+
+def validate_reasoning_fields(payload: dict) -> list[str]:
+    errors = []
+    if not isinstance(payload.get("analysis"), str) or not payload["analysis"].strip():
+        errors.append("analysis doit contenir une analyse structurée")
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) < 2 or not all(isinstance(item, str) for item in candidates):
+        errors.append("candidates doit contenir au moins deux approches")
+    if not isinstance(payload.get("selected_approach"), str) or not payload["selected_approach"].strip():
+        errors.append("selected_approach doit contenir l'approche retenue")
+    return errors
 
 
 def validate_python(code: str, tests: str) -> list[str]:
@@ -92,6 +116,14 @@ def validate_pytest_file(tests: str) -> list[str]:
     if not has_pytest_import:
         errors.append("test_solution.py doit contenir 'import pytest'")
 
+    has_solution_import = any(
+        isinstance(node, ast.ImportFrom) and node.module == "solution"
+        or isinstance(node, ast.Import) and any(alias.name == "solution" for alias in node.names)
+        for node in tree.body
+    )
+    if not has_solution_import:
+        errors.append("test_solution.py doit importer solution.py")
+
     has_test_function = any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")
         for node in ast.walk(tree)
@@ -102,30 +134,48 @@ def validate_pytest_file(tests: str) -> list[str]:
     return errors
 
 
-def build_react_steps(
-    request: str,
-    code: str,
-    tests: str,
-    correction_applied: bool,
-) -> list[tuple[str, str]]:
-    validation_errors = validate_python(code, tests) + validate_pytest_file(tests)
-    if validation_errors:
-        observation = "Erreurs résiduelles détectées : " + "; ".join(validation_errors)
-    else:
-        observation = "La syntaxe Python et la structure pytest sont valides."
-
-    correction = (
-        "Correction appliquée avec succès sur le brouillon initial."
-        if correction_applied
-        else "Brouillon initial valide, aucune correction nécessaire."
-    )
-    return [
-        ("Analyse", f"Analyser la demande fonctionnelle : {request[:100]}"),
-        ("Action", "Générer solution.py et test_solution.py via Ollama, puis contrôler la syntaxe AST."),
-        ("Observation", observation),
-        ("Self-Correction", correction),
-        ("Réponse", "Affichage du code et des tests validés pour inspection et export."),
+def run_pytest_tool(code: str, tests: str) -> tuple[bool, str]:
+    """Exécute les tests générés dans un dossier temporaire isolé du projet."""
+    python_candidates = [
+        sys.executable,
+        os.path.join(os.path.dirname(__file__), ".venv", "Scripts", "python.exe"),
     ]
+    pytest_python = sys.executable
+    for candidate in python_candidates:
+        if not os.path.exists(candidate):
+            continue
+        check_pytest = subprocess.run(
+            [candidate, "-c", "import pytest"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if check_pytest.returncode == 0:
+            pytest_python = candidate
+            break
+
+    with tempfile.TemporaryDirectory(prefix="programmateur_") as temp_dir:
+        solution_path = os.path.join(temp_dir, "solution.py")
+        tests_path = os.path.join(temp_dir, "test_solution.py")
+        with open(solution_path, "w", encoding="utf-8") as solution_file:
+            solution_file.write(code)
+        with open(tests_path, "w", encoding="utf-8") as tests_file:
+            tests_file.write(tests)
+
+        try:
+            completed = subprocess.run(
+                [pytest_python, "-m", "pytest", "-q", "test_solution.py"],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "pytest interrompu après 20 secondes."
+
+        output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+        return completed.returncode == 0, output[-4000:] or "pytest n'a produit aucune sortie."
 
 
 def get_ollama_client() -> tuple[OpenAI, str, int]:
@@ -141,7 +191,14 @@ def get_ollama_client() -> tuple[OpenAI, str, int]:
 
 def ollama_generation(request: str) -> GeneratedResult:
     client, model, max_tokens = get_ollama_client()
-    required_fields = {"code", "tests", "explanation"}
+    required_fields = {
+        "analysis",
+        "candidates",
+        "selected_approach",
+        "code",
+        "tests",
+        "explanation",
+    }
 
     prompt = f"""Tu es un développeur senior et tu utilises une méthode d'agent explicite.
 Avant de répondre, applique silencieusement les étapes suivantes :
@@ -153,13 +210,17 @@ Avant de répondre, applique silencieusement les étapes suivantes :
 Ne révèle jamais cette réflexion détaillée dans la réponse. Retourne uniquement l'objet JSON demandé.
 
 Réponds uniquement avec un objet JSON valide au format exact suivant :
-{{"code": "...", "tests": "...", "explanation": "..."}}
+{{"analysis": "...", "candidates": ["...", "..."], "selected_approach": "...", "code": "...", "tests": "...", "explanation": "..."}}
 
 Spécifications :
 - Demande : {request}
 - Le champ "code" contient l'implémentation Python complète (solution.py).
 - Le champ "tests" contient le fichier complet test_solution.py qui importe pytest et les fonctions depuis solution.py.
 - tests doit contenir au moins une fonction de module nommée `test_*`, par exemple `def test_resultat():`.
+- tests doit importer les fonctions depuis `solution.py`, par exemple `from solution import fonction`.
+- Le champ "analysis" résume les contraintes, les entrées, les sorties et les cas limites.
+- Le champ "candidates" contient au moins deux approches distinctes envisagées.
+- Le champ "selected_approach" explique brièvement pourquoi une approche a été retenue.
 - Le champ "explanation" résume brièvement l'approche.
 - Les tests doivent rester courts et utiliser principalement des appels et des assertions simples.
 - N'utilise aucune chaîne multilignes et termine chaque chaîne Python avec ses guillemets fermants.
@@ -177,17 +238,26 @@ Spécifications :
     )
 
     payload = normalize_payload(extract_json_payload(response.choices[0].message.content))
+    react_steps = [("Analyse", payload.get("analysis", "Analyse produite par le modèle."))]
     missing_fields = required_fields - payload.keys()
-    errors = (
-        [f"Champs JSON manquants : {', '.join(sorted(missing_fields))}"]
-        if missing_fields
-        else validate_python(payload["code"], payload["tests"]) + validate_pytest_file(payload["tests"])
-    )
+    errors = [f"Champs JSON manquants : {', '.join(sorted(missing_fields))}"] if missing_fields else validate_reasoning_fields(payload)
+    if not errors:
+        react_steps.append(("Tree of Thoughts", "Pistes envisagées :\n- " + "\n- ".join(payload["candidates"]) + "\n\nApproche retenue : " + payload["selected_approach"]))
+        errors = validate_python(payload["code"], payload["tests"]) + validate_pytest_file(payload["tests"])
+        react_steps.append(("Action", "Exécuter l'outil pytest dans un dossier temporaire."))
+        if not errors:
+            tests_passed, observation = run_pytest_tool(payload["code"], payload["tests"])
+            react_steps.append(("Observation", observation))
+            if not tests_passed:
+                errors = ["Échec de pytest :\n" + observation]
+        else:
+            react_steps.append(("Observation", "; ".join(errors)))
 
     correction_applied = bool(errors)
     if errors:
-        for attempt in range(4):
+        for attempt in range(6):
             error_details = "\n".join(f"- {err}" for err in errors)
+            react_steps.append(("Self-Correction", f"Correction {attempt + 1}/6 demandée : {error_details}"))
             correction_prompt = f"""Tu es un relecteur Python chargé d'une étape de Self-Correction.
 Réécris entièrement les deux fichiers pour corriger les défauts signalés. Analyse silencieusement
 le problème et ne révèle pas ta réflexion détaillée.
@@ -196,11 +266,20 @@ Contraintes obligatoires :
 - code et tests doivent être des chaînes Python complètes et syntaxiquement valides ;
 - tests doit commencer par `import pytest` et contenir au moins une fonction de module `def test_nom():` ;
 - les fonctions importées dans tests doivent réellement exister dans code ;
+- tests doit importer les fonctions depuis `solution.py` ;
+- chaque nom appelé dans un test doit être défini dans `solution.py` ; supprime tout test pour une fonction absente ;
+- utilise des opérations Python simples et valides ; une addition utilise `x + y`, jamais `math.add(x, y)` ;
+- ne crée pas de second nom comme `add_personnalise` si la demande ne le définit pas ;
+- relis la sortie pytest et corrige précisément chaque `NameError`, `ImportError` et `AttributeError` ;
+- conserve uniquement les tests nécessaires à la demande, sans test inventé supplémentaire ;
 - tests doit rester court, avec des appels et des assertions simples ;
 - n'utilise aucune chaîne multilignes, aucun retour à la ligne dans une chaîne et aucune f-string ;
 - chaque chaîne doit avoir ses guillemets ouvrants et fermants sur la même ligne ;
 - n'utilise aucun Markdown, aucune liste et aucun commentaire hors des chaînes de code ;
-- renvoie uniquement un JSON valide avec exactement les clés code, tests et explanation.
+- analysis doit résumer les contraintes et les cas limites ;
+- candidates doit contenir au moins deux approches distinctes ;
+- selected_approach doit expliquer le choix effectué ;
+- renvoie uniquement un JSON valide avec exactement les clés analysis, candidates, selected_approach, code, tests et explanation.
 
 Défauts relevés :
 {error_details}
@@ -219,24 +298,40 @@ Brouillon à rectifier :
                 ],
             )
 
+            previous_payload = payload
             payload = normalize_payload(extract_json_payload(correction_response.choices[0].message.content))
+            for field in ("analysis", "candidates", "selected_approach"):
+                if field not in payload and field in previous_payload:
+                    payload[field] = previous_payload[field]
             missing_fields = required_fields - payload.keys()
             if missing_fields:
                 errors = [f"Champs JSON manquants : {', '.join(sorted(missing_fields))}"]
                 continue
 
-            errors = validate_python(payload["code"], payload["tests"]) + validate_pytest_file(payload["tests"])
+            errors = validate_reasoning_fields(payload) + validate_python(payload["code"], payload["tests"]) + validate_pytest_file(payload["tests"])
+            if not errors:
+                react_steps.append(("Analyse corrigée", payload["analysis"]))
+                react_steps.append(("Tree of Thoughts corrigé", "Pistes envisagées :\n- " + "\n- ".join(payload["candidates"]) + "\n\nApproche retenue : " + payload["selected_approach"]))
+                react_steps.append(("Action", "Relancer l'outil pytest après correction."))
+                tests_passed, observation = run_pytest_tool(payload["code"], payload["tests"])
+                react_steps.append(("Observation", observation))
+                if not tests_passed:
+                    errors = ["Échec de pytest :\n" + observation]
             if not errors:
                 break
 
         if errors:
             raise ValueError("Échec de la validation après correction : " + "; ".join(errors))
 
+    react_steps.append(("Réponse", "Code et tests validés, prêts à être affichés et téléchargés."))
     return GeneratedResult(
         code=payload["code"],
         tests=payload["tests"],
         explanation=payload["explanation"],
-        react_steps=build_react_steps(request, payload["code"], payload["tests"], correction_applied),
+        analysis=payload["analysis"],
+        candidates=payload["candidates"],
+        selected_approach=payload["selected_approach"],
+        react_steps=react_steps,
         correction_applied=correction_applied,
     )
 
@@ -258,7 +353,7 @@ def main() -> None:
             return
 
         st.session_state.pop("result", None)
-        with st.spinner("Génération et validation statique en cours..."):
+        with st.spinner("Génération, exécution des tests et correction en cours..."):
             try:
                 result = ollama_generation(request)
                 st.session_state["result"] = result

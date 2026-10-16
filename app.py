@@ -61,11 +61,25 @@ def extract_json_payload(raw_content: str) -> dict:
     raise ValueError("La réponse Ollama ne contient pas de JSON valide.")
 
 
+def sanitize_text(content: str) -> str:
+    """Remplace les surrogates isolés que certains modèles renvoient dans leurs textes."""
+    return content.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def normalize_python_block(content: object) -> str:
     if not isinstance(content, str):
         return ""
 
-    normalized = content.strip()
+    normalized = sanitize_text(content).strip()
+    normalized = normalized.translate(str.maketrans({
+        "’": "'",
+        "‘": "'",
+        "“": '"',
+        "”": '"',
+        "–": "-",
+        "—": "-",
+        "\u00a0": " ",
+    }))
     fenced = re.search(r"```(?:python|py)?\s*(.*?)```", normalized, re.DOTALL | re.IGNORECASE)
     if fenced:
         normalized = fenced.group(1).strip()
@@ -77,11 +91,19 @@ def normalize_python_block(content: object) -> str:
 def normalize_payload(payload: dict) -> dict:
     for field in ("code", "tests"):
         payload[field] = normalize_python_block(payload.get(field))
+    for field in ("analysis", "selected_approach", "explanation"):
+        if isinstance(payload.get(field), str):
+            payload[field] = sanitize_text(payload[field])
     if isinstance(payload.get("candidates"), str):
         payload["candidates"] = [
             candidate.strip(" -")
             for candidate in re.split(r"\r?\n|;", payload["candidates"])
             if candidate.strip(" -")
+        ]
+    elif isinstance(payload.get("candidates"), list):
+        payload["candidates"] = [
+            sanitize_text(candidate) if isinstance(candidate, str) else candidate
+            for candidate in payload["candidates"]
         ]
     return payload
 
@@ -281,6 +303,8 @@ Contraintes obligatoires :
 - utilise des opérations Python simples et valides ; une addition utilise `x + y`, jamais `math.add(x, y)` ;
 - ne crée pas de second nom comme `add_personnalise` si la demande ne le définit pas ;
 - relis la sortie pytest et corrige précisément chaque `NameError`, `ImportError` et `AttributeError` ;
+- pour un cas négatif, corrige l'attente du test avec `assert not` au lieu de modifier une solution correcte ;
+- vérifie que chaque assertion correspond au comportement attendu, notamment pour les cas limites ;
 - conserve uniquement les tests nécessaires à la demande, sans test inventé supplémentaire ;
 - tests doit rester court, avec des appels et des assertions simples ;
 - n'utilise aucune chaîne multilignes, aucun retour à la ligne dans une chaîne et aucune f-string ;

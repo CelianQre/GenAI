@@ -369,7 +369,7 @@ def main() -> None:
                 st.session_state["result"] = result
             except Exception as error:
                 st.error(
-                    "La génération Ollama a échoué. Aucun résultat de démonstration n'a été affiché. "
+                    "La génération Ollama a échoué. "
                     f"Détail : {type(error).__name__}: {error}"
                 )
                 return

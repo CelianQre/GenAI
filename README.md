@@ -51,7 +51,8 @@ La validation vérifie la syntaxe AST, la présence de `import pytest`, l'import
 d'au moins une fonction `test_*`. Un outil dédié écrit ensuite les fichiers dans un dossier temporaire
 et exécute réellement `pytest`. La sortie du test (succès ou erreur) devient l'observation de l'agent.
 En cas d'échec de syntaxe ou de test, le brouillon et l'observation sont renvoyés au modèle pour une
-nouvelle génération, jusqu'à quatre tentatives.
+nouvelle génération, jusqu'à six tentatives. Si le Python utilisé par Streamlit ne contient pas
+pytest, l'application recherche automatiquement celui de `.venv` avant d'exécuter les tests.
 
 Après la génération, le bloc repliable **Raisonnement de l'agent** présente l'analyse retournée,
 les pistes candidates, le choix effectué, l'action pytest, sa sortie réelle et les corrections
@@ -64,11 +65,11 @@ le résultat sont conservés.
 ## Méthodes écartées
 
 - **Chain of Thought détaillée** : écartée sous sa forme brute, car afficher la chaîne de pensée
-	privée n'est pas nécessaire pour évaluer l'agent. Elle est remplacée par une analyse structurée
-	et vérifiable.
+    privée n'est pas nécessaire pour évaluer l'agent. Elle est remplacée par une analyse structurée
+    et vérifiable.
 - **Tree of Thoughts complet** : écarté, car le sujet ne nécessite pas un grand arbre de recherche
-	ni l'exploration de nombreuses branches. Deux approches candidates suffisent pour comparer la
-	simplicité, la robustesse et la testabilité d'une solution Python.
+    ni l'exploration de nombreuses branches. Deux approches candidates suffisent pour comparer la
+    simplicité, la robustesse et la testabilité d'une solution Python.
 - **Conversation libre de type chatbot** : écartée, car elle ne fournit ni outil, ni validation,
 	ni boucle de correction explicite.
 
